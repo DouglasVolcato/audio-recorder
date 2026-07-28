@@ -17,7 +17,7 @@ const (
 
 	blockAlign = channels * bitsPerSample / 8
 
-	recordSeconds = 10
+	qpcUnitsPerSecond = 10_000_000
 
 	microphoneGain = 3.0
 	computerGain   = 0.8
@@ -104,10 +104,11 @@ func openCapture(
 	return audioClient, captureClient, nil
 }
 
-func Record10Seconds(
+func Record(
 	inputDevice *wca.IMMDevice,
 	outputDevice *wca.IMMDevice,
 	filename string,
+	stop <-chan struct{},
 ) error {
 	if filename == "" {
 		filename = "gravacao.wav"
@@ -155,14 +156,20 @@ func Record10Seconds(
 
 	defer inputAudio.Stop()
 
-	var inputPCM []byte
-	var outputPCM []byte
+	var inputPackets []capturePacket
+	var outputPackets []capturePacket
 
-	deadline := time.Now().Add(
-		recordSeconds * time.Second,
-	)
+	recording := true
+	for recording {
+		select {
+		case <-stop:
+			recording = false
+		default:
+		}
+		if !recording {
+			break
+		}
 
-	for time.Now().Before(deadline) {
 		inputData, err := readAvailable(inputCapture)
 		if err != nil {
 			return fmt.Errorf(
@@ -172,7 +179,7 @@ func Record10Seconds(
 		}
 
 		if len(inputData) > 0 {
-			inputPCM = append(inputPCM, inputData...)
+			inputPackets = append(inputPackets, inputData...)
 		}
 
 		outputData, err := readAvailable(outputCapture)
@@ -184,28 +191,25 @@ func Record10Seconds(
 		}
 
 		if len(outputData) > 0 {
-			outputPCM = append(outputPCM, outputData...)
+			outputPackets = append(outputPackets, outputData...)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
 
 	inputData, err := readAvailable(inputCapture)
 	if err == nil && len(inputData) > 0 {
-		inputPCM = append(inputPCM, inputData...)
+		inputPackets = append(inputPackets, inputData...)
 	}
 
 	outputData, err := readAvailable(outputCapture)
 	if err == nil && len(outputData) > 0 {
-		outputPCM = append(outputPCM, outputData...)
+		outputPackets = append(outputPackets, outputData...)
 	}
 
-	targetBytes := sampleRate *
-		channels *
-		(bitsPerSample / 8) *
-		recordSeconds
-
-	inputPCM = fitLength(inputPCM, targetBytes)
-	outputPCM = fitLength(outputPCM, targetBytes)
+	inputPCM, outputPCM := alignCapturedPCM(
+		inputPackets,
+		outputPackets,
+	)
 
 	mixedPCM := mixPCM16(
 		inputPCM,
@@ -227,14 +231,19 @@ func Record10Seconds(
 	return nil
 }
 
+type capturePacket struct {
+	data        []byte
+	qpcPosition uint64
+}
+
 func readAvailable(
 	capture *wca.IAudioCaptureClient,
-) ([]byte, error) {
+) ([]capturePacket, error) {
 	if capture == nil {
 		return nil, fmt.Errorf("capture client é nil")
 	}
 
-	var result []byte
+	var result []capturePacket
 
 	for {
 		var packetFrames uint32
@@ -288,8 +297,64 @@ func readAvailable(
 			)
 		}
 
-		result = append(result, chunk...)
+		result = append(result, capturePacket{
+			data:        chunk,
+			qpcPosition: qpcPosition,
+		})
 	}
+}
+
+func alignCapturedPCM(
+	inputPackets []capturePacket,
+	outputPackets []capturePacket,
+) ([]byte, []byte) {
+	startQPC := firstCaptureTimestamp(inputPackets)
+	outputStartQPC := firstCaptureTimestamp(outputPackets)
+
+	if startQPC == 0 ||
+		(outputStartQPC != 0 && outputStartQPC < startQPC) {
+		startQPC = outputStartQPC
+	}
+
+	return buildPCMTimeline(inputPackets, startQPC),
+		buildPCMTimeline(outputPackets, startQPC)
+}
+
+func firstCaptureTimestamp(packets []capturePacket) uint64 {
+	for _, packet := range packets {
+		if packet.qpcPosition != 0 {
+			return packet.qpcPosition
+		}
+	}
+
+	return 0
+}
+
+func buildPCMTimeline(
+	packets []capturePacket,
+	startQPC uint64,
+) []byte {
+	var timeline []byte
+	var sequentialOffset int
+
+	for _, packet := range packets {
+		offset := sequentialOffset
+		if startQPC != 0 && packet.qpcPosition >= startQPC {
+			frames := (packet.qpcPosition-startQPC)*sampleRate +
+				qpcUnitsPerSecond/2
+			offset = int(frames/qpcUnitsPerSecond) * blockAlign
+		}
+
+		end := offset + len(packet.data)
+		if end > len(timeline) {
+			timeline = append(timeline, make([]byte, end-len(timeline))...)
+		}
+
+		copy(timeline[offset:end], packet.data)
+		sequentialOffset = end
+	}
+
+	return timeline
 }
 
 func fitLength(data []byte, size int) []byte {
@@ -307,7 +372,7 @@ func mixPCM16(
 ) []byte {
 	size := len(input)
 
-	if len(output) < size {
+	if len(output) > size {
 		size = len(output)
 	}
 
@@ -316,17 +381,23 @@ func mixPCM16(
 	mixed := make([]byte, size)
 
 	for i := 0; i < size; i += 2 {
-		inputSample := int16(
-			binary.LittleEndian.Uint16(
-				input[i : i+2],
-			),
-		)
+		var inputSample int16
+		if i+2 <= len(input) {
+			inputSample = int16(
+				binary.LittleEndian.Uint16(
+					input[i : i+2],
+				),
+			)
+		}
 
-		outputSample := int16(
-			binary.LittleEndian.Uint16(
-				output[i : i+2],
-			),
-		)
+		var outputSample int16
+		if i+2 <= len(output) {
+			outputSample = int16(
+				binary.LittleEndian.Uint16(
+					output[i : i+2],
+				),
+			)
+		}
 
 		value :=
 			float64(inputSample)*inputGain +
